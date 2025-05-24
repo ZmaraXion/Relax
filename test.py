@@ -1,71 +1,141 @@
+import os
 import cv2
+import matplotlib.pyplot as plt
+import pywt
 import numpy as np
-from skimage.segmentation import slic
-from skimage.metrics import structural_similarity as ssim
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
 
-# 讀取圖片並轉換到 Lab 色彩空間
-img = cv2.imread('statue_image.jpg')
-img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)
+def estimate_local_noise(channel, window_size=5):
+    """估計局部噪點標準差"""
+    # 使用高斯模糊近似局部方差
+    blurred = cv2.GaussianBlur(channel.astype(np.float32), (window_size, window_size), 0)
+    blurred_square = cv2.GaussianBlur(channel.astype(np.float32)**2, (window_size, window_size), 0)
+    variance = blurred_square - blurred**2
+    variance = np.maximum(variance, 0)  # 避免負值
+    return np.sqrt(variance)
 
-# 預去噪（雙邊濾波）
-img_filtered = img_lab.copy()
-img_filtered[:, :, 1:3] = cv2.bilateralFilter(img_filtered[:, :, 1:3], d=9, sigmaColor=20, sigmaSpace=20)
+def adaptive_nlm(channel, guide, h_base=10, k=1.5, template_size=7, search_size=21):
+    """自適應NLM，使用分塊近似"""
+    # 估計局部噪點
+    sigma = estimate_local_noise(channel)
+    h_map = k * sigma + h_base  # 動態h，h_base避免過小
+    h_map = np.clip(h_map, 5, 50)  # 限制h範圍
 
-# SLIC 超像素分割
-n_segments = 150
-segments = slic(img_filtered, n_segments=n_segments, compactness=15, sigma=1, start_label=1)
+    # 分塊處理以模擬像素級h
+    block_size = 32
+    height, width = channel.shape
+    denoised = np.zeros_like(channel, dtype=np.float32)
+    
+    for i in range(0, height, block_size):
+        for j in range(0, width, block_size):
+            i_end = min(i + block_size, height)
+            j_end = min(j + block_size, width)
+            block = channel[i:i_end, j:j_end]
+            h = np.mean(h_map[i:i_end, j:j_end])  # 使用塊平均h
+            block_denoised = cv2.fastNlMeansDenoising(
+                block, h=float(h), templateWindowSize=template_size, searchWindowSize=search_size
+            )
+            denoised[i:i_end, j:j_end] = block_denoised
+    
+    # 應用引導濾波增強邊緣
+    guided = cv2.ximgproc.guidedFilter(
+        guide=guide, src=denoised, radius=5, eps=500
+    )
+    return guided.astype(np.uint8)
 
-# 初始化輸出圖片
-output_lab = img_lab.copy()
+def estimate_local_noise2(channel, window_size=5):
+    """估計局部噪點標準差"""
+    blurred = cv2.GaussianBlur(channel.astype(np.float32), (window_size, window_size), 0)
+    blurred_square = cv2.GaussianBlur(channel.astype(np.float32)**2, (window_size, window_size), 0)
+    variance = blurred_square - blurred**2
+    variance = np.maximum(variance, 0)
+    return np.sqrt(variance)
 
-# 自適應 K-Means 聚類
-for label in np.unique(segments):
-    mask = (segments == label).astype(np.uint8)
-    pixels = img_lab[mask > 0][:, 1:3]
-    if len(pixels) < 30:  # 忽略小面積超像素
-        continue
+def generate_color_mask(a, b, threshold=40, kernel_size=3):
+    """生成色彩保護遮罩（Lab空間）"""
+    # Lab空間的a、b範圍為[-128, 127]，偏移至[0, 255]計算飽和度
+    a_shifted = a.astype(np.float32) + 128
+    b_shifted = b.astype(np.float32) + 128
+    saturation = np.sqrt(a_shifted**2 + b_shifted**2)
+    # 高通濾波檢測高飽和度邊緣
+    sobel_x = cv2.Sobel(saturation, cv2.CV_32F, 1, 0, ksize=kernel_size)
+    sobel_y = cv2.Sobel(saturation, cv2.CV_32F, 0, 1, ksize=kernel_size)
+    edge_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
+    edge_magnitude = cv2.normalize(edge_magnitude, None, 0, 1, cv2.NORM_MINMAX)
+    mask = (edge_magnitude > threshold / 255.0).astype(np.float32)
+    return cv2.GaussianBlur(mask, (5, 5), 0)  # 平滑遮罩邊界
 
-    # 自適應 K 值選擇（輪廓係數）
-    max_k = min(4, len(pixels))
-    best_k, best_score = 1, -1
-    for k in range(1, max_k + 1):
-        if k == 1:
-            score = 0.8  # 假設單色區域
-        else:
-            kmeans = KMeans(n_clusters=k, random_state=0).fit(pixels)
-            score = silhouette_score(pixels, kmeans.labels_)
-        if score > best_score:
-            best_score = score
-            best_k = k
+def adaptive_nlm2(channel, guide, mask, h_base=8, k=1.2, template_size=5, search_size=15):
+    """自適應NLM，融入色彩保護遮罩"""
+    sigma = estimate_local_noise2(channel)
+    h_map = k * sigma + h_base
+    h_map = h_map * (1 - mask)  # 在高飽和度區域降低h
+    h_map = np.clip(h_map, 3, 40)  # 適應Lab空間的較小範圍
+    
+    block_size = 32
+    height, width = channel.shape
+    denoised = np.zeros_like(channel, dtype=np.float32)
+    
+    for i in range(0, height, block_size):
+        for j in range(0, width, block_size):
+            i_end = min(i + block_size, height)
+            j_end = min(j + block_size, width)
+            block = channel[i:i_end, j:j_end]
+            h = np.mean(h_map[i:i_end, j:j_end])
+            block_denoised = cv2.fastNlMeansDenoising(
+                block, h=float(h), templateWindowSize=template_size, searchWindowSize=search_size
+            )
+            denoised[i:i_end, j:j_end] = block_denoised
+    
+    guided = cv2.ximgproc.guidedFilter(
+        guide=guide, src=denoised, radius=3, eps=50
+    )
+    return guided.astype(np.float32)  # 保持float32以支持Lab範圍
 
-    # 應用 K-Means 聚類
-    kmeans = KMeans(n_clusters=best_k, random_state=0).fit(pixels)
-    labels, counts = np.unique(kmeans.labels_, return_counts=True)
-    dominant_idx = labels[np.argmax(counts)]
-    a_main, b_main = kmeans.cluster_centers_[dominant_idx]
+def color_correction(denoised, original):
+    """色彩校正，恢復飽和度"""
+    mu_orig, std_orig = np.mean(original), np.std(original)
+    mu_denoised, std_denoised = np.mean(denoised), np.std(denoised)
+    if std_denoised > 0:  # 避免除零
+        corrected = denoised * (std_orig / std_denoised) + (mu_orig - mu_denoised)
+    else:
+        corrected = denoised
+    return np.clip(corrected, 0, 255).astype(np.uint8)
 
-    # 特殊處理：雕像和背景應為灰色
-    if abs(a_main) > 10 or abs(b_main) > 10:  # 若偏離灰色，改用中值
-        a_main, b_main = np.median(pixels, axis=0)
+def histogram_matching(denoised, original):
+    """直方圖匹配恢復色彩分佈"""
+    # 計算原始和去噪後的直方圖與CDF
+    hist_orig, bins = np.histogram(original.flatten(), 256, [0, 256])
+    hist_denoised, _ = np.histogram(denoised.flatten(), 256, [0, 256])
+    cdf_orig = hist_orig.cumsum() / hist_orig.sum()
+    cdf_denoised = hist_denoised.cumsum() / hist_denoised.sum()
+    
+    # 建立映射表
+    mapping = np.zeros(256, dtype=np.uint8)
+    for i in range(256):
+        j = np.argmin(np.abs(cdf_denoised[i] - cdf_orig))
+        mapping[i] = j
+    
+    # 應用映射
+    corrected = cv2.LUT(denoised, mapping)
+    return corrected
 
-    # 應用主導顏色（保留 L 通道）
-    output_lab[mask > 0, 1] = a_main
-    output_lab[mask > 0, 2] = b_main
+img_path = r".\NOISY_SRGB_010_.png"
+img = cv2.imread(img_path)
+lab = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)
 
-# 邊界平滑（Poisson Blending）
-mask_all = np.zeros_like(segments, dtype=np.uint8)
-for label in np.unique(segments):
-    mask = (segments == label).astype(np.uint8) * 255
-    mask = cv2.GaussianBlur(mask, (3, 3), 0)
-    mask_all = cv2.bitwise_or(mask_all, mask)
-output_lab = cv2.seamlessClone(output_lab, img_lab, mask_all, (img.shape[1]//2, img.shape[0]//2), cv2.NORMAL_CLONE)
+l, a, b = cv2.split(lab)
+lab_denoised_ada = lab.copy()
+lab_denoised_ada[:, :, 1:2] = np.expand_dims(adaptive_nlm(a.copy(), l.copy(), h_base=10, k=1.5), axis=-1)
+lab_denoised_ada[:, :, 2:3] = np.expand_dims(adaptive_nlm(b.copy(), l.copy(), h_base=10, k=1.5), axis=-1)
 
-# 轉回 RGB 並保存
-output_rgb = cv2.cvtColor(output_lab, cv2.COLOR_Lab2RGB)
-cv2.imwrite('denoised_statue_image.jpg', output_rgb)
+color_mask = generate_color_mask(a.copy(), b.copy(), threshold=30)
+lab_denoised_ada_mask = lab.copy()
+lab_denoised_ada_mask[:, :, 1:2] = np.expand_dims(adaptive_nlm2(a.copy(), l.copy(), color_mask, h_base=10, k=1.5), axis=-1)
+lab_denoised_ada_mask[:, :, 2:3] = np.expand_dims(adaptive_nlm2(b.copy(), l.copy(), color_mask, h_base=10, k=1.5), axis=-1)
 
-# 質量評估
-ssim_score = ssim(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.cvtColor(output_rgb, cv2.COLOR_BGR2GRAY))
-print(f"SSIM Score: {ssim_score:.4f}")
+# Merge and convert back to RGB
+cv2.imwrite(r'.\output_NLM_ada_lab.jpg', cv2.cvtColor(lab_denoised_ada, cv2.COLOR_Lab2BGR))
+cv2.imwrite(r'.\output_NLM_ada_lab_mask.jpg', cv2.cvtColor(lab_denoised_ada_mask, cv2.COLOR_Lab2BGR))
+
+# corr = histogram_matching(cv2.cvtColor(lab_denoised_ada, cv2.COLOR_Lab2BGR), img)
+# cv2.imwrite(r'.\output_NLM_ada_lab_corr.jpg', corr)
