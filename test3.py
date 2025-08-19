@@ -1,138 +1,198 @@
-# sscd_postprocessing_final.py
-#
-# 描述:
-# 本腳本根據 "A Self-Supervised Descriptor for Image Copy Detection (SSCD)" 論文
-# 及其官方 GitHub 原始碼，實現了不依賴 FAISS 的 embedding 後處理流程。
-# 流程包含兩個主要步驟：
-# 1. PCA 白化 (PCA Whitening)
-# 2. L2 標準化 (L2 Normalization)
-#
-# 作者: Gemini
-# 日期: 2025-07-30
-
-import numpy as np
-from sklearn.decomposition import PCA
-
-def learn_pca_whitening(reference_embeddings: np.ndarray) -> PCA:
-    """
-    從參考嵌入資料集 (reference embeddings) 中學習 PCA 白化轉換。
-    根據 SSCD 論文，這個轉換模型應該從一個大型的、具代表性的背景資料集
-    （在此範例中，我們使用 reference_embeddings）中學習。
-
-    Args:
-        reference_embeddings (np.ndarray): 用於學習轉換的參考嵌入，維度為 (n_samples, n_features)。
-
-    Returns:
-        PCA: 一個已經 fit 好的 scikit-learn PCA 物件。
-    """
-    print(f"INFO: 從 {reference_embeddings.shape[0]} 個參考嵌入中學習 PCA 白化轉換...")
-    
-    # 根據論文 Section 5.3，SSCD 使用完整的描述符維度進行白化。
-    # `whiten=True` 是 scikit-learn 中執行白化操作的關鍵參數。
-    n_features = reference_embeddings.shape[1]
-    pca = PCA(n_components=n_features, whiten=True)
-    
-    # 使用參考資料集來訓練 PCA 模型
-    pca.fit(reference_embeddings)
-    
-    return pca
-
-def l2_normalize(vectors: np.ndarray) -> np.ndarray:
-    """
-    對一個矩陣中的每一行向量進行 L2 標準化，使其長度變為 1。
-
-    Args:
-        vectors (np.ndarray): 維度為 (n_samples, n_features) 的 numpy 矩陣。
-
-    Returns:
-        np.ndarray: 標準化後的矩陣。
-    """
-    # 計算每個向量的 L2 範數（長度）
-    norm = np.linalg.norm(vectors, axis=1, keepdims=True)
-    
-    # 增加一個極小值 epsilon 來避免除以零的錯誤
-    epsilon = 1e-10
-    
-    return vectors / (norm + epsilon)
-
-def apply_postprocessing(embeddings: np.ndarray, pca_model: PCA) -> np.ndarray:
-    """
-    應用 SSCD 的後處理流程：先白化，再 L2 標準化。
-    這個順序遵循論文 Section 5.3 以及官方程式碼的實現。
-
-    Args:
-        embeddings (np.ndarray): 需要進行後處理的嵌入，維度為 (n_samples, n_features)。
-        pca_model (PCA): 已經從參考資料集學習好的 PCA 模型。
-
-    Returns:
-        np.ndarray: 經過完整後處理的嵌入。
-    """
-    # 步驟 1: 應用已學習的 PCA 白化轉換
-    whitened_embeddings = pca_model.transform(embeddings)
-    
-    # 步驟 2: 對白化後的向量進行 L2 標準化
-    final_embeddings = l2_normalize(whitened_embeddings)
-    
-    return final_embeddings
-
-def main():
-    """
-    主執行函數，演示完整的 SSCD 後處理與相似度搜索流程。
-    """
-    print("--- SSCD 描述符後處理與相似度搜索展示 (不依賴 FAISS) ---")
-
-    # 0. 準備模擬資料
-    # 假設 query_embeddings 的維度是 [5, 512]
-    # 假設 reference_embeddings 的維度是 [100, 512]
-    descriptor_dim = 512
-    num_queries = 5
-    num_references = 100
-
-    print(f"\n[步驟 0] 模擬生成 {num_queries} 個查詢 (query) 和 {num_references} 個參考 (reference) 嵌入 (維度: {descriptor_dim})...")
-    # 使用 np.random.randn 生成常態分佈的數據，更接近真實世界的 embedding 分佈
-    query_embeddings = np.random.randn(num_queries, descriptor_dim).astype('float32')
-    reference_embeddings = np.random.randn(num_references, descriptor_dim).astype('float32')
-    
-    print(f"原始 Query 維度: {query_embeddings.shape}")
-    print(f"原始 Reference 維度: {reference_embeddings.shape}")
-
-    # --- 後處理流程 ---
-    
-    # 1. 從 Reference Embeddings 學習 PCA 白化轉換
-    print("\n[步驟 1] 從 Reference Embeddings 學習 PCA 白化轉換...")
-    pca_model = learn_pca_whitening(reference_embeddings)
-    print("PCA 白化轉換學習完成。")
-
-    # 2. 將學習到的轉換應用到 Query 和 Reference Embeddings
-    print("\n[步驟 2] 應用後處理流程 (白化 -> L2 標準化)...")
-    final_query_embeddings = apply_postprocessing(query_embeddings, pca_model)
-    final_ref_embeddings = apply_postprocessing(reference_embeddings, pca_model)
-    print("所有嵌入向量均已處理完成。")
-    
-    # 驗證 L2 標準化是否成功
-    # 處理後，向量長度（L2 範數）應非常接近 1
-    print(f"驗證: 處理後第一個 Query 向量的 L2 範數: {np.linalg.norm(final_query_embeddings[0]):.6f}")
-    print(f"驗證: 處理後第一個 Reference 向量的 L2 範數: {np.linalg.norm(final_ref_embeddings[0]):.6f}")
-
-    # --- 相似度搜索 ---
-    print("\n[步驟 3] 開始進行相似度搜索...")
-    # 因為所有向量都經過 L2 標準化，它們的內積等同於餘弦相似度。
-    # 這可以透過一次矩陣乘法高效完成。
-    similarity_matrix = np.dot(final_query_embeddings, final_ref_embeddings.T)
-    
-    print(f"計算完成的相似度矩陣維度: {similarity_matrix.shape}")
-    print("(矩陣中的每個元素 (i, j) 代表第 i 個 query 和第 j 個 reference 的相似度)")
-    
-    # 4. 為每個 query 找到最匹配的 reference
-    best_matches_indices = np.argmax(similarity_matrix, axis=1)
-    best_matches_scores = np.max(similarity_matrix, axis=1)
-
-    print("\n--- 搜索結果 ---")
-    for i in range(num_queries):
-        print(f"查詢 (Query) #{i}:")
-        print(f"  - 最匹配的參考 (Reference) 索引: {best_matches_indices[i]}")
-        print(f"  - 餘弦相似度分數: {best_matches_scores[i]:.4f}")
-
-if __name__ == "__main__":
+"""  
+Required packages:  
+- torch  
+- torchvision  
+- opencv-python  
+- numpy  
+- tqdm  
+- argparse  
+- PIL (Pillow)  
+"""  
+  
+import argparse  
+import os  
+import torch  
+import cv2  
+import numpy as np  
+from PIL import Image  
+from torchvision import transforms  
+from tqdm import tqdm  
+import torch.nn.functional as F  
+  
+  
+def create_transform():  
+    """Create preprocessing transform for SSCD model inference."""  
+    # Based on SSCD recommended preprocessing  
+    normalize = transforms.Normalize(  
+        mean=[0.485, 0.456, 0.406],   
+        std=[0.229, 0.224, 0.225]  
+    )  
+    return transforms.Compose([  
+        transforms.Resize([320, 320]),  # Square resize for efficiency  
+        transforms.ToTensor(),  
+        normalize,  
+    ])  
+  
+  
+def load_model(model_path, device):  
+    """Load SSCD TorchScript model."""  
+    print(f"Loading model from: {model_path}")  
+    model = torch.jit.load(model_path, map_location=device)  
+    model.eval()  
+    return model  
+  
+  
+def load_query_frames(query_dir, transform):  
+    """Load and preprocess 5 query frames."""  
+    query_frames = []  
+    frame_files = sorted([f for f in os.listdir(query_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])  
+      
+    if len(frame_files) != 5:  
+        raise ValueError(f"Query directory must contain exactly 5 frames, found {len(frame_files)}")  
+      
+    print(f"Loading {len(frame_files)} query frames...")  
+    for frame_file in frame_files:  
+        frame_path = os.path.join(query_dir, frame_file)  
+        img = Image.open(frame_path).convert('RGB')  
+        img_tensor = transform(img)  
+        query_frames.append(img_tensor)  
+      
+    return torch.stack(query_frames)  
+  
+  
+def extract_video_embeddings(video_path, model, transform, batch_size, device):  
+    """Extract embeddings from all video frames using batched processing."""  
+    cap = cv2.VideoCapture(video_path)  
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))  
+      
+    if total_frames == 0:  
+        raise ValueError(f"Could not read video or video is empty: {video_path}")  
+      
+    print(f"Processing {total_frames} frames from video...")  
+      
+    embeddings = []  
+    batch_frames = []  
+      
+    with tqdm(total=total_frames, desc="Extracting embeddings") as pbar:  
+        for frame_idx in range(total_frames):  
+            ret, frame = cap.read()  
+            if not ret:  
+                break  
+                  
+            # Convert BGR to RGB  
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  
+            img = Image.fromarray(frame_rgb)  
+            img_tensor = transform(img)  
+            batch_frames.append(img_tensor)  
+              
+            # Process batch when full or at the end  
+            if len(batch_frames) == batch_size or frame_idx == total_frames - 1:  
+                batch_tensor = torch.stack(batch_frames).to(device)  
+                  
+                with torch.no_grad():  
+                    batch_embeddings = model(batch_tensor)  
+                  
+                embeddings.append(batch_embeddings.cpu())  
+                batch_frames = []  
+                pbar.update(len(batch_tensor))  
+      
+    cap.release()  
+      
+    # Concatenate all embeddings  
+    all_embeddings = torch.cat(embeddings, dim=0)  
+    print(f"Extracted embeddings shape: {all_embeddings.shape}")  
+      
+    return all_embeddings  
+  
+  
+def compute_query_embedding(query_frames, model, device):  
+    """Compute single representative embedding for query frames."""  
+    print("Computing query embedding...")  
+    query_frames = query_frames.to(device)  
+      
+    with torch.no_grad():  
+        query_embeddings = model(query_frames)  
+      
+    # Average the 5 query embeddings to get single representative vector  
+    query_vector = torch.mean(query_embeddings, dim=0, keepdim=True)  
+    return query_vector.cpu()  
+  
+  
+def find_best_sequence(query_vector, video_embeddings):  
+    """Find the best matching 5-frame sequence using sliding window."""  
+    print("Searching for best matching sequence...")  
+      
+    num_frames = video_embeddings.shape[0]  
+    if num_frames < 5:  
+        raise ValueError(f"Video must have at least 5 frames, got {num_frames}")  
+      
+    best_similarity = -1.0  
+    best_start_frame = 0  
+      
+    # Sliding window of size 5  
+    for start_idx in range(num_frames - 4):  
+        # Get 5-frame window  
+        window_embeddings = video_embeddings[start_idx:start_idx + 5]  
+          
+        # Compute average embedding for this window  
+        window_vector = torch.mean(window_embeddings, dim=0, keepdim=True)  
+          
+        # Compute cosine similarity  
+        similarity = F.cosine_similarity(query_vector, window_vector).item()  
+          
+        if similarity > best_similarity:  
+            best_similarity = similarity  
+            best_start_frame = start_idx  
+      
+    return best_start_frame, best_similarity  
+  
+  
+def main():  
+    parser = argparse.ArgumentParser(description="Video Frame Retrieval using SSCD")  
+    parser.add_argument("--video_path", required=True, help="Path to reference MP4 video")  
+    parser.add_argument("--query_dir", required=True, help="Directory containing 5 query frames")  
+    parser.add_argument("--model_path", required=True, help="Path to SSCD TorchScript model (.pt file)")  
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for processing")  
+      
+    args = parser.parse_args()  
+      
+    # Validate inputs  
+    if not os.path.exists(args.video_path):  
+        raise FileNotFoundError(f"Video file not found: {args.video_path}")  
+    if not os.path.exists(args.query_dir):  
+        raise FileNotFoundError(f"Query directory not found: {args.query_dir}")  
+    if not os.path.exists(args.model_path):  
+        raise FileNotFoundError(f"Model file not found: {args.model_path}")  
+      
+    # Setup device  
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  
+    print(f"Using device: {device}")  
+      
+    # Create preprocessing transform  
+    transform = create_transform()  
+      
+    # Load model  
+    model = load_model(args.model_path, device)  
+      
+    # Load query frames  
+    query_frames = load_query_frames(args.query_dir, transform)  
+      
+    # Compute query embedding  
+    query_vector = compute_query_embedding(query_frames, model, device)  
+      
+    # Extract video embeddings  
+    video_embeddings = extract_video_embeddings(  
+        args.video_path, model, transform, args.batch_size, device  
+    )  
+      
+    # Find best matching sequence  
+    best_start_frame, best_similarity = find_best_sequence(query_vector, video_embeddings)  
+      
+    # Output result  
+    print("\n" + "="*60)  
+    print(f"✅ Best match found. The 5-frame sequence starts at frame: {best_start_frame} (Similarity: {best_similarity:.3f})")  
+    print("="*60)  
+  
+  
+if __name__ == "__main__":  
     main()
-
