@@ -1,16 +1,3 @@
-hare
-
-return to facebookresearch/sscd-copy-detection
-Act as an expert Python developer and ML engineer, adhering to the best software engineering practices. Context: I am working on a video frame similarity task. I have used the SSCD_disc_mixup pre-trai...
-Hide full text
-Act as an expert Python developer and ML engineer, adhering to the best software engineering practices. Context: I am working on a video frame similarity task. I have used the SSCD_disc_mixup pre-trained model to extract frame-level embeddings for two videos (Video A and Video B), which are saved as NumPy files. * Input Data: * video_A_embeddings.npy: with a shape of (50, 512). * video_B_embeddings.npy: with a shape of (42, 512). Primary Goal: Create a well-structured Python script (demo.py) that randomly selects a frame from Video A and finds the frame with the highest cosine similarity in Video B. Key Requirements: * Flexible Post-processing Pipeline: * The SSCD documentation suggests that post-processing steps (centering, whitening, normalization) can improve accuracy but might be optional or used in combination. * Please implement a post-processing function, e.g., postprocess(embeddings, pca_model=None, use_centering: bool = True, use_whitening: bool = True, use_l2_norm: bool = True). * This function should allow enabling or disabling each step via boolean flags. * The default behavior should apply the recommended pipeline: Centering -> Whitening -> L2 Normalization. * Correct Whitening Implementation: * When whitening is enabled, the PCA model must be fit only on a reference dataset (we'll use Video B's embeddings for this). * This fitted PCA model must then be used to transform the embeddings of both Video A and Video B. Do not fit the PCA model on Video A's data. * Similarity Calculation: * All similarity calculations must be performed on the post-processed embeddings. * Use Cosine Similarity as the metric. Deliverable: * A single, directly executable Python script named demo.py. * Code Structure: Encapsulate the core logic into functions (e.g., load_data, postprocess, find_most_similar) for readability and reusability. * Modern Python Style: Use type hints for all function signatures (parameters and return values). * Testability: The script should start by generating two dummy embedding files, allowing it to be run immediately for verification. * Clear Comments: The code must be well-commented, especially the post-processing pipeline and the PCA fit/transform logic. * Clean Output: The script's final output should clearly print: * The index of the randomly selected frame from Video A. * The index of the most similar frame found in Video B. * The corresponding cosine similarity score.
-Deep
-Searched across facebookresearch/sscd-copy-detection
-
-Thought Process
-Based on my analysis of the SSCD repository, I'll create a comprehensive Python script that implements the post-processing pipeline for video frame similarity. The SSCD codebase uses FAISS codecs for post-processing, particularly PCA whitening and L2 normalization. disc_eval.py:67-72 disc_eval.py:170-180
-
-Here's the complet
 #!/usr/bin/env python3  
 """  
 Video Frame Similarity using SSCD Embeddings  
