@@ -1,133 +1,201 @@
-import cv2
 import numpy as np
-import random
+import cv2
+from scipy.signal import convolve2d
+from scipy.spatial.distance import cdist
 
-# 參數設置
-video1_path = "video1.mp4"
-video2_path = "video2.mp4"
-output_dir = "output/"
-height, width = 480, 640
-group_size = 5
-
-# 讀取影片
-def load_video(video_path):
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(preprocess_frame(frame))
-    cap.release()
-    return frames
-
-def preprocess_frame(frame, height=480, width=640):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    resized = cv2.resize(gray, (width, height))
-    return resized
-
-# 規範化軌跡
-def normalize_tracks(tracks, height, width):
-    normalized = []
-    for track in tracks:
-        norm_track = [(pt_idx, [pt[0] / width, pt[1] / height]) for pt_idx, pt in track]
-        normalized.append(norm_track)
-    return normalized
-
-def filter_tracks(tracks, min_length=2, max_length=5):
-    return [track for track in tracks if min_length <= len(track) <= max_length]
-
-# 計算軌跡距離
-def compute_trajectory_distance(tracks1, tracks2, height, width):
-    norm_tracks1 = normalize_tracks(tracks1, height, width)
-    norm_tracks2 = normalize_tracks(tracks2, height, width)
-    
-    distances = []
-    for t1 in norm_tracks1:
-        for t2 in norm_tracks2:
-            if len(t1) == len(t2):
-                dist = np.mean([np.linalg.norm(np.array(t1[i][1]) - np.array(t2[i][1])) for i in range(len(t1))])
-                distances.append(dist)
-    return np.mean(distances) if distances else float('inf')
-
-# 幾何一致性檢查
-def compute_homography(tracks1, tracks2):
-    if len(tracks1) < 4 or len(tracks2) < 4:
-        return None, []
-    pts1 = np.float32([t[0][1] for t in tracks1]).reshape(-1, 1, 2)
-    pts2 = np.float32([t[0][1] for t in tracks2]).reshape(-1, 1, 2)
-    H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, 5.0)
-    inliers = [i for i, m in enumerate(mask) if m]
-    return H, inliers
-
-# 匹配 group
-def match_groups(tracks_v1, tracks_v2, height, width):
-    best_group_id = -1
-    min_distance = float('inf')
-    best_inliers = 0
-    
-    for group_id, tracks in tracks_v2.items():
-        dist = compute_trajectory_distance(tracks_v1, tracks, height, width)
-        H, inliers = compute_homography(tracks_v1, tracks, height, width)
-        inlier_count = len(inliers)
+class SCIELAB:
+    def __init__(self, visual_angle_degree=1.0, ppi=96.0, distance_inch=24.0):
+        """
+        初始化 S-CIELAB 計算器
         
-        score = dist / (inlier_count + 1)
-        if score < min_distance:
-            min_distance = score
-            best_group_id = group_id
-            best_inliers = inlier_count
-    
-    return best_group_id, min_distance, best_inliers
+        Args:
+            visual_angle_degree: 視角 (通常不需要調整)
+            ppi: 螢幕像素密度 (Pixels Per Inch)
+            distance_inch: 觀看距離 (Inches)
+        """
+        # 計算每個視角包含的像素數 (Pixels Per Degree, ppd)
+        # 公式: ppd = distance * tan(1 degree) * ppi 
+        # 近似為: distance * (pi/180) * ppi
+        self.ppd = distance_inch * (np.pi / 180.0) * ppi
+        
+        # 定義 XYZ 到 對手色空間 (Opponent Color Space) 的轉換矩陣
+        # 參考 Zhang & Wandell, 1996
+        self.m_xyz_2_opp = np.array([
+            [0.279, 0.720, -0.107], # O1: Luminance
+            [-0.448, 0.290, 0.157], # O2: Red-Green
+            [0.086, -0.590, 0.504]  # O3: Blue-Yellow
+        ])
+        self.m_opp_2_xyz = np.linalg.inv(self.m_xyz_2_opp)
+        
+        # 預先計算濾波器 Kernels
+        self.kernels = self._generate_kernels()
 
-# 選擇隨機 group
-def select_random_group(frames, group_size=5):
-    start_idx = random.randint(0, len(frames) - group_size)
-    return frames[start_idx:start_idx + group_size], start_idx
+    def _generate_kernels(self):
+        """
+        根據 PPD 生成三個通道的空間濾波器 (Spatial Filters)
+        這是 S-CIELAB 的靈魂，模擬人眼 CSF。
+        使用的是 Gaussian Sum 模型。
+        """
+        # 參數來自 S-CIELAB 原始論文 (Zhang & Wandell)
+        # w: 權重, s: 擴散係數 (spread)
+        params = [
+            # Channel 1 (Luminance) - 3 Gaussians
+            {'w': [0.921, 0.105, -0.108], 's': [0.0283, 0.133, 0.433]},
+            # Channel 2 (Red-Green) - 2 Gaussians
+            {'w': [0.531, 0.330], 's': [0.0392, 0.494]},
+            # Channel 3 (Blue-Yellow) - 2 Gaussians
+            {'w': [0.488, 0.371], 's': [0.0536, 0.386]}
+        ]
+        
+        kernels = []
+        for p in params:
+            # 根據 spread 和 ppd 決定 kernel 大小
+            # 3 sigma 覆蓋原則
+            max_s = max(p['s'])
+            support = int(3.5 * max_s * self.ppd) 
+            if support % 2 == 0: support += 1 # 確保是奇數
+            
+            x, y = np.meshgrid(np.arange(-support//2 + 1, support//2 + 1),
+                               np.arange(-support//2 + 1, support//2 + 1))
+            r2 = x**2 + y**2
+            
+            # 混合高斯
+            kernel = np.zeros_like(r2, dtype=np.float64)
+            for w, s in zip(p['w'], p['s']):
+                sigma = s * self.ppd
+                kernel += w * np.exp(-r2 / (2 * sigma**2))
+            
+            # 正規化：確保亮度不變
+            kernel /= np.sum(kernel)
+            kernels.append(kernel)
+            
+        return kernels
 
-# 可視化對齊結果
-def visualize_alignment(frames_v1, frames_v2, tracks_v1, tracks_v2, start_idx_v1, group_id_v2):
-    group_v1 = frames_v1[start_idx_v1:start_idx_v1 + 5]
-    group_v2 = frames_v2[group_id_v2:group_id_v2 + 5]
-    
-    output_frames_v1 = [cv2.cvtColor(f, cv2.COLOR_GRAY2BGR) for f in group_v1]
-    output_frames_v2 = [cv2.cvtColor(f, cv2.COLOR_GRAY2BGR) for f in group_v2]
-    
-    for track in tracks_v1:
-        for i, (pt_idx, pt) in enumerate(track):
-            if i < len(output_frames_v1):
-                pt = pt.astype(int)
-                cv2.circle(output_frames_v1[i], tuple(pt), 3, (0, 255, 0), -1)
-                if i > 0:
-                    pt_prev = track[i - 1][1].astype(int)
-                    cv2.line(output_frames_v1[i], tuple(pt_prev), tuple(pt), (0, 0, 255), 1)
-    
-    for track in tracks_v2[group_id_v2]:
-        for i, (pt_idx, pt) in enumerate(track):
-            if i < len(output_frames_v2):
-                pt = pt.astype(int)
-                cv2.circle(output_frames_v2[i], tuple(pt), 3, (0, 255, 0), -1)
-                if i > 0:
-                    pt_prev = track[i - 1][1].astype(int)
-                    cv2.line(output_frames_v2[i], tuple(pt_prev), tuple(pt), (0, 0, 255), 1)
-    
-    return output_frames_v1, output_frames_v2
+    def _rgb_to_xyz(self, img_rgb):
+        """
+        sRGB -> Linear RGB -> XYZ
+        注意：這裡假設輸入是標準 sRGB [0, 255]
+        """
+        # 1. 正規化到 [0, 1]
+        img = img_rgb.astype(np.float64) / 255.0
+        
+        # 2. 反 Gamma 校正 (sRGB -> Linear RGB)
+        mask = img > 0.04045
+        img[mask] = ((img[mask] + 0.055) / 1.055) ** 2.4
+        img[~mask] = img[~mask] / 12.92
+        
+        # 3. Linear RGB -> XYZ (D65)
+        # OpenCV 的 COLOR_RGB2XYZ 使用的是標準 sRGB 矩陣
+        img_xyz = cv2.cvtColor(img.astype(np.float32), cv2.COLOR_RGB2XYZ)
+        return img_xyz.astype(np.float64)
 
-# 儲存影片
-def save_video(frames, output_path, fps=30):
-    h, w = frames[0].shape[:2]
-    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-    for frame in frames:
-        out.write(frame)
-    out.release()
+    def _xyz_to_cielab(self, img_xyz):
+        """
+        XYZ -> CIELAB
+        為了方便，我們可以使用 OpenCV 的實作，但需要注意 OpenCV 對 XYZ 的範圍定義。
+        這裡我們手動實作以確保精度與白點控制 (D65)。
+        """
+        # Reference White (D65)
+        Xn, Yn, Zn = 0.95047, 1.00000, 1.08883
+        
+        x = img_xyz[:, :, 0] / Xn
+        y = img_xyz[:, :, 1] / Yn
+        z = img_xyz[:, :, 2] / Zn
+        
+        def f(t):
+            delta = 6/29
+            mask = t > delta**3
+            res = np.zeros_like(t)
+            res[mask] = np.cbrt(t[mask])
+            res[~mask] = t[~mask] / (3 * delta**2) + 4/29
+            return res
+            
+        fx, fy, fz = f(x), f(y), f(z)
+        
+        L = 116 * fy - 16
+        a = 500 * (fx - fy)
+        b = 200 * (fy - fz)
+        
+        return np.stack([L, a, b], axis=-1)
 
-# 主程式
-frames_v1 = load_video(video1_path)
-frames_v2 = load_video(video2_path)
-# 假設 tracks_v1 和 tracks_v2 已從之前的程式碼生成
-# tracks_v1: List of tracks for the selected group
-# tracks_v2: Dict of {group_id: List of tracks}
-start_idx_v1, best_group_id, min_distance, inlier_count = align_videos(frames_v1, frames_v2, tracks_v1, tracks_v2, height, width)
-output_frames_v1, output_frames_v2 = visualize_alignment(frames_v1, frames_v2, tracks_v1, tracks_v2, start_idx_v1, best_group_id)
-save_video(output_frames_v1, f"{output_dir}/video1_group_{start_idx_v1}.mp4")
-save_video(output_frames_v2, f"{output_dir}/video2_group_{best_group_id}.mp4")
-print(f"Video1 group starting at frame {start_idx_v1} matches Video2 group starting at frame {best_group_id}")
+    def process_image(self, img_rgb):
+        """
+        S-CIELAB 的核心處理流程：RGB -> XYZ -> Opponent -> Filter -> XYZ -> LAB
+        """
+        # 1. RGB to XYZ
+        img_xyz = self._rgb_to_xyz(img_rgb)
+        
+        # 2. XYZ to Opponent Space
+        # 矩陣乘法: (H, W, 3) dot (3, 3).T
+        img_opp = np.dot(img_xyz, self.m_xyz_2_opp.T)
+        
+        # 3. Spatial Filtering (Separable convolution would be faster, using 2D for clarity)
+        img_opp_filtered = np.zeros_like(img_opp)
+        for i in range(3):
+            # 使用 'same' 保持尺寸，'symm' 處理邊界以減少邊緣偽影
+            img_opp_filtered[:, :, i] = convolve2d(
+                img_opp[:, :, i], self.kernels[i], mode='same', boundary='symm'
+            )
+            
+        # 4. Filtered Opponent to XYZ
+        img_xyz_filtered = np.dot(img_opp_filtered, self.m_opp_2_xyz.T)
+        
+        # 5. XYZ to CIELAB
+        img_lab = self._xyz_to_cielab(img_xyz_filtered)
+        
+        return img_lab
+
+    def compute_difference(self, img1_path, img2_path):
+        """
+        計算兩張圖的 S-CIELAB Delta E
+        """
+        # 讀取影像 (OpenCV 讀入為 BGR，需轉為 RGB)
+        img1 = cv2.imread(img1_path)
+        img2 = cv2.imread(img2_path)
+        
+        if img1 is None or img2 is None:
+            raise ValueError("無法讀取影像")
+            
+        if img1.shape != img2.shape:
+             raise ValueError(f"影像尺寸不符: {img1.shape} vs {img2.shape}")
+
+        img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
+        img2 = cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)
+
+        # 取得經過空間濾波的 LAB 數值
+        lab1 = self.process_image(img1)
+        lab2 = self.process_image(img2)
+        
+        # 計算 Delta E (Euclidean distance in LAB space)
+        # 這是最原始的 Delta E 1976，若需要更精準可改用 Delta E 2000
+        delta_e = np.sqrt(np.sum((lab1 - lab2)**2, axis=2))
+        
+        return delta_e
+
+# --- 使用範例 ---
+if __name__ == "__main__":
+    # 設定情境：一般桌上型螢幕，距離 50cm (約 20 inch)，96 DPI
+    scielab = SCIELAB(ppi=96, distance_inch=19.7)
+    
+    # 假設你有兩張圖片 'ref.png' 和 'dist.png'
+    # 為了演示，我們生成兩張假圖
+    img1 = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+    cv2.imwrite('ref.png', img1)
+    # 加一點高頻雜訊
+    noise = np.random.normal(0, 20, img1.shape).astype(np.int16)
+    img2 = np.clip(img1 + noise, 0, 255).astype(np.uint8)
+    cv2.imwrite('dist.png', img2)
+
+    try:
+        diff_map = scielab.compute_difference('ref.png', 'dist.png')
+        print(f"平均 S-CIELAB Error: {np.mean(diff_map):.4f}")
+        print(f"最大 S-CIELAB Error: {np.max(diff_map):.4f}")
+        
+        # 視覺化誤差圖
+        diff_viz = (diff_map / np.max(diff_map) * 255).astype(np.uint8)
+        cv2.imwrite('scielab_diff.png', cv2.applyColorMap(diff_viz, cv2.COLORMAP_JET))
+        print("誤差熱力圖已保存為 scielab_diff.png")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        
