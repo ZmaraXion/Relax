@@ -1,133 +1,139 @@
 import cv2
-import torch
 import numpy as np
-from transformers import AutoImageProcessor, AutoModel
-from accelerated_features import XFeat
 
-# 參數設置
-video_path = "input_video.mp4"
-output_dir = "output/"
-group_size = 5
-height, width = 480, 640
-min_length = 2
-max_length = 5
-match_threshold = 0.2
+class ChromaDenoiser:
+    def __init__(self, radius=8, eps=0.02, dark_boost=1.5):
+        """
+        初始化參數
+        :param radius: 導向濾波的半徑 (控制平滑範圍)
+        :param eps: 導向濾波的正則化參數 (控制對邊緣的敏感度，越小越保持邊緣)
+        :param dark_boost: 暗部去噪強度的增益係數 (大於1代表暗部去噪更強)
+        """
+        self.radius = radius
+        # eps 傳入通常是針對 0-1 範圍，OpenCV 內部運算可能需要調整
+        self.eps = eps  
+        self.dark_boost = dark_boost
 
-# 讀取影片
-def load_video(video_path):
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(preprocess_frame(frame))
-    cap.release()
-    return frames
+    def _gamma_correction(self, img, gamma=2.2, inverse=False):
+        """ 處理 Gamma 校正與反校正 """
+        if inverse:
+            # Linearize: sRGB -> Linear RGB
+            return np.power(img, gamma)
+        else:
+            # Re-apply Gamma: Linear RGB -> sRGB
+            return np.power(img, 1.0 / gamma)
 
-def preprocess_frame(frame, height=480, width=640):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    resized = cv2.resize(gray, (width, height))
-    return resized
+    def process(self, rgb_img):
+        """
+        核心處理流程
+        :param rgb_img: 輸入 RGB 影像 (0-255, uint8)
+        :return: 處理後的 RGB 影像
+        """
+        # 1. 前處理：歸一化到 [0, 1] 並轉為浮點數
+        img_float = rgb_img.astype(np.float32) / 255.0
 
-def generate_frame_groups(frames, group_size=5):
-    return [frames[i:i + group_size] for i in range(len(frames) - group_size + 1)]
+        # 2.【關鍵點一】Gamma Linearization (線性化)
+        # 在線性空間處理噪點物理上更準確，避免色彩偏移
+        img_linear = self._gamma_correction(img_float, inverse=True)
 
-# 初始化 XFeat 和 LightGlue
-xfeat = XFeat(model_path="xfeat_model.pth", device="cuda" if torch.cuda.is_available() else "cpu")
-processor = AutoImageProcessor.from_pretrained("ETH-CVG/lightglue_superpoint")
-matcher = AutoModel.from_pretrained("ETH-CVG/lightglue_superpoint")
+        # 3. 色彩空間轉換 (使用 LAB)
+        # L: 亮度 (結構資訊), A/B: 色度 (噪點資訊)
+        lab = cv2.cvtColor(img_linear, cv2.COLOR_RGB2Lab)
+        l_channel, a_channel, b_channel = cv2.split(lab)
 
-def process_frame_group(group):
-    keypoints_list, descriptors_list = [], []
-    for frame in group:
-        keypoints, descriptors = xfeat.detectAndDescribe(frame)
-        keypoints_list.append(keypoints)
-        descriptors_list.append(descriptors)
-    
-    matches_list = []
-    for i in range(len(group) - 1):
-        inputs = processor([group[i], group[i + 1]], return_tensors="pt")
-        with torch.no_grad():
-            outputs = matcher(**inputs)
-        image_sizes = [(group[i].shape[0], group[i].shape[1]), (group[i + 1].shape[0], group[i + 1].shape[1])]
-        matches = processor.post_process_keypoint_matching(outputs, [image_sizes])[0]
-        matches_list.append({
-            "keypoints0": matches["keypoints0"].numpy(),
-            "keypoints1": matches["keypoints1"].numpy(),
-            "scores": matches["matching_scores"].numpy()
-        })
-    return keypoints_list, matches_list
+        # 4.【關鍵點二】建立導引圖 (Guidance Image)
+        # 使用 L 通道作為導引，因為它包含最準確的結構資訊
+        guidance = l_channel
 
-def generate_tracks(keypoints_list, matches_list, min_length=2, max_length=5):
-    tracks = []
-    track_id = 0
-    active_tracks = {}
-
-    for i, matches in enumerate(matches_list):
-        keypoints0 = keypoints_list[i]
-        keypoints1 = keypoints_list[i + 1]
-        match_indices = np.vstack((matches["keypoints0"], matches["keypoints1"])).T
-        match_scores = matches["scores"]
-
-        new_active_tracks = {}
-        for m, score in zip(match_indices, match_scores):
-            if score < match_threshold:
-                continue
-            p0_idx, p1_idx = m
-            p0 = keypoints0[p0_idx]
-            p1 = keypoints1[p1_idx]
-            track_found = False
-            for tid, track in active_tracks.items():
-                if track[-1][0] == p0_idx and len(track) < max_length:
-                    track.append((p1_idx, p1))
-                    new_active_tracks[tid] = track
-                    track_found = True
-                    break
-            if not track_found:
-                new_active_tracks[track_id] = [(p0_idx, p0), (p1_idx, p1)]
-                track_id += 1
+        # 5.【關鍵點三】建立暗部自適應權重 Mask (Perceptual Masking)
+        # 計算亮度權重：越暗的地方 (L 值小)，權重越大
+        # L channel 在 OpenCV float 下通常範圍較大，我們先 normalize 觀測一下
+        # 假設 L 範圍約 0-100
+        l_norm = l_channel / 100.0
         
-        for tid, track in new_active_tracks.items():
-            if len(track) >= min_length:
-                tracks.append(track)
-        active_tracks = new_active_tracks
+        # 權重公式：(1 - L) * boost。 L越小，weight越高。
+        # 這裡做一個簡單的 Sigmoid 或者是線性反轉
+        adaptive_weight = 1.0 + (1.0 - l_norm) * (self.dark_boost - 1.0)
+        adaptive_weight = np.clip(adaptive_weight, 1.0, self.dark_boost)
+        
+        # 為了應用這個 weight，我們調整 eps (epsilon)。
+        # Epsilon 越小，邊緣保護越好但去噪越弱；Epsilon 越大，越模糊。
+        # 我們希望暗部更模糊一點 (去噪強)，所以暗部 eps 要變大？
+        # 其實更直接的做法是：做兩次濾波，或是在混合時調整。
+        # 為了實作簡潔且高效，我們這裡採用「動態混合」策略。
+        
+        # 6. 執行 Guided Filter (核心去噪)
+        # 針對 A 和 B 通道分別濾波
+        # 使用 opencv-contrib 的 guidedFilter
+        
+        # 注意：eps 在 OpenCV 中是像素值差的平方。
+        # 如果數值範圍是 0-100 (Lab)，eps 需要設大一點，例如 1000
+        # 如果我們把 Lab 轉回 0-1 區間處理會比較直觀
+        
+        a_norm = a_channel # Lab 的 ab 範圍通常在 -128 到 127 之間 (視實作而定)
+        b_norm = b_channel 
+        
+        # 為了通用性，這裡直接用 guidedFilter，OpenCV 會自動處理
+        # radius: 濾波半徑
+        # eps: 這裡需要根據 Lab 的數值範圍調整。OpenCV Lab float 範圍 L:0-100, a,b: -127~127
+        # 經驗值：對於 float Lab, eps 設為 10~50 左右比較合適 (對應 0-1 的 0.001~0.005)
+        # 我們使用輸入的 self.eps (假設針對 0-1) 乘上數值範圍的平方比例
+        real_eps = (self.eps * 100) ** 2 
+
+        a_clean = cv2.ximgproc.guidedFilter(guide=guidance, src=a_channel, radius=self.radius, eps=real_eps)
+        b_clean = cv2.ximgproc.guidedFilter(guide=guidance, src=b_channel, radius=self.radius, eps=real_eps)
+
+        # 7.【關鍵點三實作】基於亮度的自適應混合 (Blending)
+        # 在暗部使用 clean 版本，在極亮部可以稍微保留一點原始細節(如果需要)
+        # 這裡我們直接將 clean 的結果應用，但如果你發現亮部邊緣有溢色，可以用 mask 混合回來
+        # 這裡示範如何用 Mask 混合：
+        
+        # 製作混合 Mask: 暗部全用 clean，亮部 80% clean (視情況)
+        # 為了最大化去彩噪，這裡我們假設全圖都要去，但你可以打開下面的註解做混合
+        
+        # mask = np.clip(1.0 - l_norm, 0.0, 1.0) # 簡單的暗部 mask
+        # a_final = a_clean * mask + a_channel * (1 - mask)
+        # b_final = b_clean * mask + b_channel * (1 - mask)
+        
+        # 目前策略：直接採用濾波結果，因為 Guided Filter 本身就有保邊功能
+        a_final = a_clean
+        b_final = b_clean
+
+        # 8. 合併通道
+        lab_clean = cv2.merge([l_channel, a_final, b_final])
+
+        # 9. 轉回 RGB Linear
+        img_clean_linear = cv2.cvtColor(lab_clean, cv2.COLOR_Lab2RGB)
+
+        # 10. 轉回 Gamma (sRGB)
+        img_clean_srgb = self._gamma_correction(img_clean_linear, inverse=False)
+
+        # 11. 格式處理 (Clip & Convert to uint8)
+        img_clean_srgb = np.clip(img_clean_srgb * 255, 0, 255).astype(np.uint8)
+
+        return img_clean_srgb
+
+# --- 使用範例 ---
+if __name__ == "__main__":
+    # 讀取圖片 (模擬含彩噪的 ISP 輸出)
+    # 請替換成你自己的圖片路徑
+    input_img = cv2.imread("noisy_isp_output.jpg") 
     
-    return tracks
+    if input_img is not None:
+        # 參數調整建議：
+        # radius: 根據噪點顆粒大小調整。如果是大色斑，設為 16 或 32。細小噪點設為 4-8。
+        # eps: 控制邊緣保護。數值越小，越不願意跨越邊緣模糊 (保護越好但去噪越弱)。
+        denoiser = ChromaDenoiser(radius=8, eps=0.01, dark_boost=1.2)
+        
+        result_img = denoiser.process(input_img)
 
-def visualize_tracks(group, tracks):
-    output_frames = [cv2.cvtColor(f, cv2.COLOR_GRAY2BGR) for f in group]
-    for track in tracks:
-        for i, (pt_idx, pt) in enumerate(track):
-            if i < len(output_frames):
-                pt = pt.astype(int)
-                cv2.circle(output_frames[i], tuple(pt), 3, (0, 255, 0), -1)
-                if i > 0:
-                    pt_prev = track[i - 1][1].astype(int)
-                    cv2.line(output_frames[i], tuple(pt_prev), tuple(pt), (0, 0, 255), 1)
-    return output_frames
-
-def save_video(frames, output_path, fps=30):
-    h, w = frames[0].shape[:2]
-    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-    for frame in frames:
-        out.write(frame)
-    out.release()
-
-def save_tracks(tracks, output_path):
-    with open(output_path, 'w') as f:
-        for i, track in enumerate(tracks):
-            f.write(f"Track {i}:\n")
-            for pt_idx, pt in track:
-                f.write(f"{pt[0]},{pt[1]}\n")
-
-# 主程式
-frames = load_video(video_path)
-groups = generate_frame_groups(frames, group_size)
-
-for i, group in enumerate(groups):
-    keypoints_list, matches_list = process_frame_group(group)
-    tracks = generate_tracks(keypoints_list, matches_list, min_length, max_length)
-    output_frames = visualize_tracks(group, tracks)
-    save_video(output_frames, f"{output_dir}/group_{i}.mp4")
-    save_tracks(tracks, f"{output_dir}/group_{i}_tracks.txt")
+        # 顯示比較
+        comparison = np.hstack((input_img, result_img))
+        cv2.imshow("Original vs Chroma Denoised", comparison)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        
+        # 儲存結果
+        cv2.imwrite("result.png", result_img)
+    else:
+        print("請提供有效的影像路徑進行測試。")
