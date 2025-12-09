@@ -1,139 +1,118 @@
+import torch
 import cv2
 import numpy as np
+import pyiqa
+import matplotlib.pyplot as plt
 
-class ChromaDenoiser:
-    def __init__(self, radius=8, eps=0.02, dark_boost=1.5):
+class VideoAnomalyDetector:
+    def __init__(self, metric_name='maniqa', device='cuda'):
         """
-        初始化參數
-        :param radius: 導向濾波的半徑 (控制平滑範圍)
-        :param eps: 導向濾波的正則化參數 (控制對邊緣的敏感度，越小越保持邊緣)
-        :param dark_boost: 暗部去噪強度的增益係數 (大於1代表暗部去噪更強)
+        初始化偵測器
+        model_name: 推薦 'maniqa' (高精確度) 或 'musiq' (Google開發, 魯棒性佳)
         """
-        self.radius = radius
-        # eps 傳入通常是針對 0-1 範圍，OpenCV 內部運算可能需要調整
-        self.eps = eps  
-        self.dark_boost = dark_boost
-
-    def _gamma_correction(self, img, gamma=2.2, inverse=False):
-        """ 處理 Gamma 校正與反校正 """
-        if inverse:
-            # Linearize: sRGB -> Linear RGB
-            return np.power(img, gamma)
-        else:
-            # Re-apply Gamma: Linear RGB -> sRGB
-            return np.power(img, 1.0 / gamma)
-
-    def process(self, rgb_img):
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        print(f"Loading IQA Model: {metric_name} on {self.device}...")
+        # PyIQA 自動下載預訓練權重
+        self.iqa_metric = pyiqa.create_metric(metric_name, device=self.device)
+        
+    def get_scene_diff(self, frame1, frame2):
         """
-        核心處理流程
-        :param rgb_img: 輸入 RGB 影像 (0-255, uint8)
-        :return: 處理後的 RGB 影像
+        計算簡單的結構/色彩差異，用於判斷是否為 Scene Cut
+        使用 Histogram Intersection
         """
-        # 1. 前處理：歸一化到 [0, 1] 並轉為浮點數
-        img_float = rgb_img.astype(np.float32) / 255.0
+        h1 = cv2.calcHist([frame1], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+        h2 = cv2.calcHist([frame2], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+        cv2.normalize(h1, h1).flatten()
+        cv2.normalize(h2, h2).flatten()
+        return cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
 
-        # 2.【關鍵點一】Gamma Linearization (線性化)
-        # 在線性空間處理噪點物理上更準確，避免色彩偏移
-        img_linear = self._gamma_correction(img_float, inverse=True)
-
-        # 3. 色彩空間轉換 (使用 LAB)
-        # L: 亮度 (結構資訊), A/B: 色度 (噪點資訊)
-        lab = cv2.cvtColor(img_linear, cv2.COLOR_RGB2Lab)
-        l_channel, a_channel, b_channel = cv2.split(lab)
-
-        # 4.【關鍵點二】建立導引圖 (Guidance Image)
-        # 使用 L 通道作為導引，因為它包含最準確的結構資訊
-        guidance = l_channel
-
-        # 5.【關鍵點三】建立暗部自適應權重 Mask (Perceptual Masking)
-        # 計算亮度權重：越暗的地方 (L 值小)，權重越大
-        # L channel 在 OpenCV float 下通常範圍較大，我們先 normalize 觀測一下
-        # 假設 L 範圍約 0-100
-        l_norm = l_channel / 100.0
+    def detect(self, video_path, scene_cut_thresh=0.85, z_score_thresh=3.0):
+        cap = cv2.VideoCapture(video_path)
+        scores = []
+        scene_diffs = []
+        frame_indices = []
         
-        # 權重公式：(1 - L) * boost。 L越小，weight越高。
-        # 這裡做一個簡單的 Sigmoid 或者是線性反轉
-        adaptive_weight = 1.0 + (1.0 - l_norm) * (self.dark_boost - 1.0)
-        adaptive_weight = np.clip(adaptive_weight, 1.0, self.dark_boost)
+        prev_frame = None
+        idx = 0
         
-        # 為了應用這個 weight，我們調整 eps (epsilon)。
-        # Epsilon 越小，邊緣保護越好但去噪越弱；Epsilon 越大，越模糊。
-        # 我們希望暗部更模糊一點 (去噪強)，所以暗部 eps 要變大？
-        # 其實更直接的做法是：做兩次濾波，或是在混合時調整。
-        # 為了實作簡潔且高效，我們這裡採用「動態混合」策略。
+        print("Starting analysis...")
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # 1. 轉換為 Tensor 並計算 IQA 分數
+            # PyIQA 接受 0-1 的 RGB Tensor (NCHW)
+            img_tensor = pyiqa.utils.img2tensor(frame).to(self.device).unsqueeze(0)
+            
+            with torch.no_grad():
+                # score 通常越高代表品質越好
+                score = self.iqa_metric(img_tensor).item()
+            
+            # 2. 計算與上一幀的內容相似度 (Scene Cut Detection)
+            is_scene_cut = False
+            if prev_frame is not None:
+                content_sim = self.get_scene_diff(prev_frame, frame)
+                if content_sim < scene_cut_thresh:
+                    is_scene_cut = True
+                    # 轉場時，強制將品質變化視為無效或標記特殊
+            else:
+                content_sim = 1.0 # 第一幀
+            
+            scores.append(score)
+            scene_diffs.append(content_sim)
+            frame_indices.append(idx)
+            
+            prev_frame = frame
+            idx += 1
+            
+            if idx % 100 == 0:
+                print(f"Processed {idx} frames...")
+
+        cap.release()
         
-        # 6. 執行 Guided Filter (核心去噪)
-        # 針對 A 和 B 通道分別濾波
-        # 使用 opencv-contrib 的 guidedFilter
+        # 3. 後處理：偵測異常跳變
+        scores = np.array(scores)
+        # 計算分數的一階差分 (Delta)
+        deltas = np.diff(scores, prepend=scores[0])
         
-        # 注意：eps 在 OpenCV 中是像素值差的平方。
-        # 如果數值範圍是 0-100 (Lab)，eps 需要設大一點，例如 1000
-        # 如果我們把 Lab 轉回 0-1 區間處理會比較直觀
+        # 使用滑動窗口計算局部 Mean 和 Std 進行 Z-score 異常偵測
+        window_size = 30
+        anomalies = []
         
-        a_norm = a_channel # Lab 的 ab 範圍通常在 -128 到 127 之間 (視實作而定)
-        b_norm = b_channel 
-        
-        # 為了通用性，這裡直接用 guidedFilter，OpenCV 會自動處理
-        # radius: 濾波半徑
-        # eps: 這裡需要根據 Lab 的數值範圍調整。OpenCV Lab float 範圍 L:0-100, a,b: -127~127
-        # 經驗值：對於 float Lab, eps 設為 10~50 左右比較合適 (對應 0-1 的 0.001~0.005)
-        # 我們使用輸入的 self.eps (假設針對 0-1) 乘上數值範圍的平方比例
-        real_eps = (self.eps * 100) ** 2 
+        for i in range(len(deltas)):
+            # 忽略開頭與 Scene Cut
+            if scene_diffs[i] < scene_cut_thresh:
+                continue
+                
+            start = max(0, i - window_size)
+            end = min(len(deltas), i + window_size)
+            local_mean = np.mean(deltas[start:end])
+            local_std = np.std(deltas[start:end]) + 1e-6 # 避免除以0
+            
+            z_score = abs(deltas[i] - local_mean) / local_std
+            
+            # 異常定義：分數劇烈下降 (Delta 為負且很大) 且 Z-score 超標
+            # 若要偵測變好或變壞，則只看 abs(z_score)
+            # 這裡假設我們要抓「變模糊/變差」，所以 deltas[i] < 0
+            if z_score > z_score_thresh and abs(deltas[i]) > 0.05: # 0.05 是絕對分數變化的最小閾值，需根據模型範圍調整
+                anomalies.append({
+                    'frame_idx': i,
+                    'score': scores[i],
+                    'prev_score': scores[i-1],
+                    'delta': deltas[i],
+                    'z_score': z_score,
+                    'type': 'Quality Drop' if deltas[i] < 0 else 'Quality Spike'
+                })
+                
+        return anomalies, scores
 
-        a_clean = cv2.ximgproc.guidedFilter(guide=guidance, src=a_channel, radius=self.radius, eps=real_eps)
-        b_clean = cv2.ximgproc.guidedFilter(guide=guidance, src=b_channel, radius=self.radius, eps=real_eps)
-
-        # 7.【關鍵點三實作】基於亮度的自適應混合 (Blending)
-        # 在暗部使用 clean 版本，在極亮部可以稍微保留一點原始細節(如果需要)
-        # 這裡我們直接將 clean 的結果應用，但如果你發現亮部邊緣有溢色，可以用 mask 混合回來
-        # 這裡示範如何用 Mask 混合：
-        
-        # 製作混合 Mask: 暗部全用 clean，亮部 80% clean (視情況)
-        # 為了最大化去彩噪，這裡我們假設全圖都要去，但你可以打開下面的註解做混合
-        
-        # mask = np.clip(1.0 - l_norm, 0.0, 1.0) # 簡單的暗部 mask
-        # a_final = a_clean * mask + a_channel * (1 - mask)
-        # b_final = b_clean * mask + b_channel * (1 - mask)
-        
-        # 目前策略：直接採用濾波結果，因為 Guided Filter 本身就有保邊功能
-        a_final = a_clean
-        b_final = b_clean
-
-        # 8. 合併通道
-        lab_clean = cv2.merge([l_channel, a_final, b_final])
-
-        # 9. 轉回 RGB Linear
-        img_clean_linear = cv2.cvtColor(lab_clean, cv2.COLOR_Lab2RGB)
-
-        # 10. 轉回 Gamma (sRGB)
-        img_clean_srgb = self._gamma_correction(img_clean_linear, inverse=False)
-
-        # 11. 格式處理 (Clip & Convert to uint8)
-        img_clean_srgb = np.clip(img_clean_srgb * 255, 0, 255).astype(np.uint8)
-
-        return img_clean_srgb
-
-# --- 使用範例 ---
+# 使用範例
 if __name__ == "__main__":
-    # 讀取圖片 (模擬含彩噪的 ISP 輸出)
-    # 請替換成你自己的圖片路徑
-    input_img = cv2.imread("noisy_isp_output.jpg") 
+    # 需要先下載一個測試影片
+    detector = VideoAnomalyDetector(metric_name='maniqa') # MANIQA 分數範圍通常 0~1
+    anomalies, score_trace = detector.detect('test_video.mp4')
     
-    if input_img is not None:
-        # 參數調整建議：
-        # radius: 根據噪點顆粒大小調整。如果是大色斑，設為 16 或 32。細小噪點設為 4-8。
-        # eps: 控制邊緣保護。數值越小，越不願意跨越邊緣模糊 (保護越好但去噪越弱)。
-        denoiser = ChromaDenoiser(radius=8, eps=0.01, dark_boost=1.2)
-        
-        result_img = denoiser.process(input_img)
-
-        # 顯示比較
-        comparison = np.hstack((input_img, result_img))
-        cv2.imshow("Original vs Chroma Denoised", comparison)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-        
-        # 儲存結果
-        cv2.imwrite("result.png", result_img)
-    else:
-        print("請提供有效的影像路徑進行測試。")
+    print("\nDetected Anomalies:")
+    for a in anomalies:
+        print(f"Frame {a['frame_idx']}: Delta {a['delta']:.4f} (Z: {a['z_score']:.2f}) - {a['type']}")
